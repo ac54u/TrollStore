@@ -1,0 +1,416 @@
+name: Build TrollStore (iOS 17.0)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_version:
+        description: 'iOS SDK version to build against'
+        required: false
+        default: 'latest'
+        type: choice
+        options:
+          - 'latest'
+          - '18.4'
+          - '18.2'
+          - '17.5'
+      upload_artifacts:
+        description: 'Upload build artifacts?'
+        required: false
+        default: true
+        type: boolean
+      create_release:
+        description: 'Create GitHub Release? (requires tag)'
+        required: false
+        default: false
+        type: boolean
+
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
+
+  pull_request:
+    branches: [main, master]
+
+env:
+  THEOS: /opt/theos
+  SDKVERSION: ${{ github.event.inputs.sdk_version || 'latest' }}
+
+jobs:
+  build:
+    name: Build TrollStore
+    runs-on: macos-14
+
+    steps:
+      # ============================================================
+      # Step 1: Checkout
+      # ============================================================
+      - name: Checkout TrollStore
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ============================================================
+      # Step 2: Setup Xcode & SDK
+      # ============================================================
+      - name: Select Xcode
+        run: |
+          # List available Xcode versions
+          ls /Applications/ | grep Xcode || true
+
+          # Show available iOS SDKs
+          xcodebuild -showsdks 2>/dev/null | grep -E "iphoneos|iOS" || true
+
+          # Show current SDK version
+          xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || echo "No SDK found via xcrun"
+
+          # Print SDK path for debugging
+          xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo "No SDK path found"
+
+      # ============================================================
+      # Step 3: Cache Theos
+      # ============================================================
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.THEOS }}
+          key: theos-${{ runner.os }}-${{ hashFiles('.github/workflows/build-trollstore.yml') }}
+          restore-keys: |
+            theos-${{ runner.os }}-
+
+      # ============================================================
+      # Step 4: Install Theos
+      # ============================================================
+      - name: Install Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          echo "📦 Installing Theos..."
+          sudo git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
+          sudo chown -R $(whoami):staff $THEOS
+          echo "✅ Theos installed at $THEOS"
+
+      - name: Setup Theos environment
+        run: |
+          # Ensure THEOS is set
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+
+          # Add Theos bin to PATH
+          echo "$THEOS/bin" >> $GITHUB_PATH
+
+          # Verify Theos installation
+          if [ -f "$THEOS/bin/nic.pl" ]; then
+            echo "✅ Theos found: $(ls $THEOS/bin/ | head -5)"
+          else
+            echo "❌ Theos not properly installed!"
+            exit 1
+          fi
+
+      # ============================================================
+      # Step 5: Install Build Dependencies
+      # ============================================================
+      - name: Cache Homebrew dependencies
+        id: cache-brew
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/homebrew/Cellar/libarchive
+            /opt/homebrew/Cellar/ldid
+            /opt/homebrew/Cellar/openssl
+          key: brew-deps-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Install Build Dependencies
+        run: |
+          echo "📦 Installing dependencies via Homebrew..."
+
+          # Install libarchive (required for TrollStore compilation)
+          if ! brew list libarchive &>/dev/null; then
+            brew install libarchive
+          else
+            echo "libarchive already installed"
+          fi
+
+          # Install ldid (code signing tool)
+          if ! brew list ldid &>/dev/null; then
+            brew install ldid
+          else
+            echo "ldid already installed"
+          fi
+
+          # Install openssl (needed for RootHelper)
+          if ! brew list openssl &>/dev/null; then
+            brew install openssl
+          else
+            echo "openssl already installed"
+          fi
+
+          # Install pkg-config (needed for finding libcrypto)
+          if ! brew list pkg-config &>/dev/null; then
+            brew install pkg-config
+          else
+            echo "pkg-config already installed"
+          fi
+
+          # Verify installations
+          echo ""
+          echo "📋 Installed versions:"
+          brew list --versions libarchive ldid openssl pkg-config
+
+          # Setup pkg-config path for keg-only Homebrew packages (openssl)
+          # On Apple Silicon, Homebrew is at /opt/homebrew
+          BREW_PREFIX="$(brew --prefix)"
+          export PKG_CONFIG_PATH="${BREW_PREFIX}/opt/openssl/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> $GITHUB_ENV
+
+          # Verify pkg-config can find libcrypto (for RootHelper build)
+          echo ""
+          echo "🔍 Checking libcrypto availability:"
+          pkg-config --cflags libcrypto 2>/dev/null || echo "⚠️  libcrypto not found via pkg-config"
+          pkg-config --libs libcrypto 2>/dev/null || echo "⚠️  libcrypto libs not found via pkg-config"
+
+          # Verify libarchive is findable
+          echo ""
+          echo "🔍 Checking libarchive availability:"
+          pkg-config --cflags libarchive 2>/dev/null || echo "⚠️  libarchive not found via pkg-config (will use brew --prefix fallback)"
+          ls "${BREW_PREFIX}/opt/libarchive/include/archive.h" 2>/dev/null && echo "✅ libarchive header found" || echo "⚠️  libarchive header not found"
+
+      # ============================================================
+      # Step 6: Patch Makefiles for SDK Compatibility
+      # ============================================================
+      - name: Patch Makefiles for current SDK
+        run: |
+          echo "🔧 Patching Makefiles for SDK compatibility..."
+
+          # The Makefiles reference SDK 16.5, but GitHub runners may
+          # only have newer SDKs. Replace with 'latest' or specified version.
+          SDK="${SDKVERSION:-latest}"
+          echo "   Target SDK: $SDK"
+
+          # Find all Makefiles that specify an SDK version
+          echo ""
+          echo "📁 Makefiles BEFORE patching:"
+          grep -rn "iphone:clang:" --include="Makefile" . || true
+
+          # Replace SDK version references
+          # Pattern: iphone:clang:XX.X → iphone:clang:latest
+          find . -name "Makefile" -type f -exec sed -i '' \
+            -E 's/iphone:clang:[0-9]+\.[0-9]+/iphone:clang:'"$SDK"'/g' {} \;
+
+          # Also handle if the target format is slightly different
+          find . -name "Makefile" -type f -exec sed -i '' \
+            -E 's/TARGET := iphone:clang:[^:]+:([0-9]+\.[0-9]+)/TARGET := iphone:clang:'"$SDK"':\1/g' {} \;
+
+          echo ""
+          echo "📁 Makefiles AFTER patching:"
+          grep -rn "iphone:clang:" --include="Makefile" . || true
+
+      # ============================================================
+      # Step 7: Build pwnify (macOS tool required for IPA assembly)
+      # ============================================================
+      - name: Build and install pwnify
+        run: |
+          echo "🔨 Building pwnify..."
+          cd Pwnify
+          make clean 2>/dev/null || true
+          make
+
+          # Verify the binary was built
+          if [ ! -f "pwnify" ]; then
+            echo "❌ pwnify build failed!"
+            exit 1
+          fi
+
+          echo "✅ pwnify built successfully"
+          file pwnify
+
+          # Install pwnify so it's available in PATH for the main build
+          echo "📋 Installing pwnify to /usr/local/bin..."
+          sudo make install
+
+          # Verify it's in PATH
+          which pwnify || echo "⚠️ pwnify not in PATH"
+          pwnify --help 2>&1 || true
+
+          cd ..
+
+      # ============================================================
+      # Step 8: Compile TrollStore
+      # ============================================================
+      - name: Compile TrollStore
+        run: |
+          echo "🔨 Compiling TrollStore..."
+          echo "   THEOS: $THEOS"
+          echo "   SDKVERSION: ${SDKVERSION:-latest}"
+          echo ""
+
+          # Ensure Theos bin is in PATH
+          export PATH="$THEOS/bin:$PATH"
+
+          # Restore pkg-config path for keg-only Homebrew packages (set in Step 5)
+          # PKG_CONFIG_PATH is inherited via $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-not set}"
+
+          # Show Homebrew prefix for Theos
+          echo "BREW_PREFIX=$(brew --prefix)"
+
+          # Verify ldid is accessible (Theos provides its own, but homebrew ldid also works)
+          if command -v ldid &>/dev/null; then
+            echo "✅ ldid found at $(which ldid)"
+            ldid --version 2>&1 || true
+          elif [ -f "$THEOS/bin/ldid" ]; then
+            echo "✅ ldid found at $THEOS/bin/ldid"
+          else
+            echo "⚠️  ldid not found - some build steps may fail"
+          fi
+
+          # Verify pwnify
+          if command -v pwnify &>/dev/null; then
+            echo "✅ pwnify found at $(which pwnify)"
+          else
+            echo "❌ pwnify not found in PATH!"
+            exit 1
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "  Starting TrollStore build (make all)"
+          echo "=========================================="
+          echo ""
+
+          # Run the build
+          # Use -j flag for parallel builds where possible
+          make all 2>&1 | tee build.log
+
+          # Check for build errors
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo ""
+            echo "❌ Build failed! Check the log above for errors."
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ Build completed successfully!"
+
+      # ============================================================
+      # Step 9: Verify Build Outputs
+      # ============================================================
+      - name: List Build Artifacts
+        run: |
+          echo "📦 Build artifacts:"
+          echo "===================="
+
+          if [ -d "_build" ]; then
+            echo ""
+            echo "📁 _build directory contents:"
+            ls -la _build/ 2>/dev/null || echo "  (empty)"
+
+            echo ""
+            echo "📄 Detailed file listing:"
+            find _build -type f -exec ls -lh {} \; 2>/dev/null || true
+          else
+            echo "❌ _build directory not found!"
+            exit 1
+          fi
+
+      # ============================================================
+      # Step 10: Compress & Upload Artifacts
+      # ============================================================
+      - name: Compress artifacts for upload
+        if: ${{ github.event.inputs.upload_artifacts != 'false' }}
+        run: |
+          echo "📦 Preparing artifacts for upload..."
+
+          mkdir -p ./artifacts
+
+          # Copy all build outputs
+          if [ -f "_build/TrollStore.tar" ]; then
+            cp _build/TrollStore.tar ./artifacts/
+            echo "✅ TrollStore.tar copied"
+          fi
+
+          if [ -f "_build/TrollHelper_iOS15.ipa" ]; then
+            cp _build/TrollHelper_iOS15.ipa ./artifacts/
+            echo "✅ TrollHelper_iOS15.ipa copied"
+          fi
+
+          if [ -f "_build/TrollHelper_arm64e.ipa" ]; then
+            cp _build/TrollHelper_arm64e.ipa ./artifacts/
+            echo "✅ TrollHelper_arm64e.ipa copied"
+          fi
+
+          # Copy any deb packages (TrollHelper packages)
+          find . -name "*.deb" -exec cp {} ./artifacts/ \; 2>/dev/null || true
+
+          # Copy TrollStore Lite packages if any
+          find ./TrollStoreLite -name "*.deb" -exec cp {} ./artifacts/ \; 2>/dev/null || true
+
+          echo ""
+          echo "📋 Artifacts to upload:"
+          ls -la ./artifacts/
+
+      - name: Upload Build Artifacts
+        if: ${{ github.event.inputs.upload_artifacts != 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrollStore-iOS17-${{ github.sha }}
+          path: ./artifacts/
+          retention-days: 30
+          compression-level: 6
+
+      # ============================================================
+      # Step 11: Optional - Create GitHub Release
+      # ============================================================
+      - name: Create GitHub Release
+        if: ${{ github.event.inputs.create_release == 'true' && github.ref_type == 'tag' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./artifacts/*
+          name: "TrollStore - ${{ github.ref_name }}"
+          body: |
+            ## TrollStore Build - ${{ github.ref_name }}
+
+            - **Build Date**: ${{ github.event.repository.updated_at }}
+            - **SDK**: iOS ${{ env.SDKVERSION }}
+            - **Commit**: ${{ github.sha }}
+
+            ### Artifacts
+            - `TrollStore.tar` — Main application package
+            - `TrollHelper_iOS15.ipa` — Installer for iOS 15 devices
+            - `TrollHelper_arm64e.ipa` — Installer for arm64e devices
+            - `*.deb` — TrollHelper & TrollStore Lite packages
+
+            ### Supported iOS Versions
+            - iOS 14.0 beta 2 – 16.6.1
+            - iOS 16.7 RC (20H18)
+            - **iOS 17.0** (builds 21A326, 21A327, 21A329, 21A331)
+
+            > ⚠️ iOS 17.0.1+ is NOT supported
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+
+      # ============================================================
+      # Step 12: Build Summary
+      # ============================================================
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "  TrollStore Build Summary"
+          echo "=========================================="
+          echo ""
+          echo "Runner:     ${{ runner.os }} (${{ runner.arch }})"
+          echo "SDK:        ${SDKVERSION:-latest}"
+          echo "Theos:      $THEOS"
+          echo "Timestamp:  $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+          if [ -d "_build" ] && [ -n "$(ls -A _build 2>/dev/null)" ]; then
+            echo "📦 Build outputs:"
+            find _build -type f -exec echo "  - {} ($(du -h {} | cut -f1))" \;
+          else
+            echo "⚠️  No build outputs found"
+          fi
+          echo ""
+          echo "=========================================="
